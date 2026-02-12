@@ -1,59 +1,111 @@
+import random
 from collections import defaultdict
+from datetime import datetime
 
 def calculate_average_rating(ratings, dish_id):
+    """Calculates the average rating for a specific dish."""
     total = 0
     count = 0
-
     for r in ratings:
-        if str(r['menuItemId']) == str(dish_id):
-            total += r['rating']
+        if str(r.get('menuItemId')) == str(dish_id):
+            total += r.get('rating', 0)
             count += 1
+    return round(total / count, 1) if count > 0 else 0
 
-    if count == 0:
-        return 0
-
-    return round(total / count, 1)
-
-
-# 🔥 ADD THIS NEW FUNCTION BELOW
 
 def calculate_recommendations(db):
+    """
+    Advanced Recommendation Engine (Food Only):
+    Filters out 'drinks' and focuses on Veg/Non-Veg.
+    Mixes Top-Sellers (3 items) with Random New Arrivals (2 items) for discovery.
+    """
+    print("\n--- AI DISCOVERY ENGINE (FOOD ONLY) START ---")
+    
+    # 1. Fetch data from MongoDB
+    # Exclude 'drinks' category from recommendations
+    all_food_items = list(db.menuitems.find({
+        "isAvailable": True,
+        "category": {"$ne": "drinks"}
+    }))
+    
+    completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
+    ratings = list(db.ratings.find())
 
-    orders = db.orders.find()
-    ratings = db.ratings.find()
-
-    order_score = defaultdict(int)
-    rating_data = defaultdict(list)
-
-    # Count order frequency
-    for order in orders:
+    # Data structures for scoring
+    sales_volume = defaultdict(int)
+    rating_scores = defaultdict(list)
+    
+    # 2. Process Sales Volume
+    for order in completed_orders:
         for item in order.get("items", []):
-            menu_id = str(item["menuItemId"])
-            order_score[menu_id] += item["quantity"]
+            m_id = str(item["menuItemId"])
+            sales_volume[m_id] += item.get("quantity", 1)
 
-    # Collect ratings
-    for rating in ratings:
-        order = db.orders.find_one({"_id": rating["orderId"]})
-        if order:
-            for item in order.get("items", []):
-                menu_id = str(item["menuItemId"])
-                rating_data[menu_id].append(rating["rating"])
+    # 3. Process Ratings
+    for r in ratings:
+        m_id = str(r.get("menuItemId"))
+        rating_scores[m_id].append(r.get("rating", 0))
 
-    final_score = {}
+    # 4. Score Food Items
+    scored_dishes = []
+    for item in all_food_items:
+        m_id = str(item["_id"])
+        
+        # Calculate Base Stats
+        volume = sales_volume.get(m_id, 0)
+        avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores else 0
+        
+        # Scoring Formula: 60% Volume, 40% Rating
+        score = (0.6 * volume) + (0.4 * avg_r)
+        
+        scored_dishes.append({
+            "id": m_id,
+            "name": item["name"],
+            "score": round(score, 1),
+            "sales": volume,
+            "createdAt": item.get("createdAt", datetime.min)
+        })
 
-    for menu_id, count in order_score.items():
-        avg_rating = 0
-        if menu_id in rating_data:
-            avg_rating = sum(rating_data[menu_id]) / len(rating_data[menu_id])
+    # Sort by performance (Top Sellers)
+    scored_dishes.sort(key=lambda x: x["score"], reverse=True)
 
-        final_score[menu_id] = (0.7 * count) + (0.3 * avg_rating)
+    # 5. Identify "Discovery Candidates" (Randomized Selection)
+    # Get all food items with low sales count (< 15)
+    discovery_pool = [d for d in scored_dishes if d["sales"] < 15]
+    
+    # 6. Construct Final Hybrid List (Mix: 3 Top Sellers + 2 Random Discovery)
+    final_recommendation_ids = []
+    
+    # Take top 3 established performers
+    for d in scored_dishes[:3]:
+        final_recommendation_ids.append(d["id"])
+        print(f" [ESTABLISHED FOOD] {d['name']} - Score: {d['score']}")
 
-    sorted_items = sorted(
-        final_score.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    # Randomized Discovery: Pick 2 random items from the discovery pool
+    # Excluding those already in the top 3
+    remaining_discovery_pool = [d for d in discovery_pool if d["id"] not in final_recommendation_ids]
+    
+    if remaining_discovery_pool:
+        # Shuffle the pool for randomness
+        random.shuffle(remaining_discovery_pool)
+        
+        added_discovery = 0
+        for n in remaining_discovery_pool:
+            final_recommendation_ids.append(n["id"])
+            print(f" [RANDOM DISCOVERY] {n['name']} - Promoted")
+            added_discovery += 1
+            if added_discovery >= 2:
+                break
 
-    top_5 = [item[0] for item in sorted_items[:5]]
+    # Final Guard: Fill up to 5 if the list is still short
+    if len(final_recommendation_ids) < 5:
+        for d in scored_dishes:
+            if d["id"] not in final_recommendation_ids:
+                final_recommendation_ids.append(d["id"])
+            if len(final_recommendation_ids) >= 5:
+                break
 
-    return top_5
+    print(f"FINAL FOOD-ONLY OUTPUT: {final_recommendation_ids}")
+    print("--- AI DISCOVERY ENGINE END ---\n")
+
+    return final_recommendation_ids
