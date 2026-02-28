@@ -1,48 +1,66 @@
+
+import os
 import random
 from collections import defaultdict
-from datetime import datetime
-from textblob import TextBlob  # NEW: NLP library for Sentiment Analysis
+from textblob import TextBlob
+from pymongo import MongoClient
+from dotenv import load_dotenv
 
-def calculate_average_rating(ratings, dish_id):
-    """Calculates the average rating for a specific dish using granular data."""
-    total = 0
-    count = 0
-    for r in ratings:
-        # Check granular dish ratings if they exist
-        dish_scores = r.get('dishRatings', [])
-        found_granular = False
-        
-        for ds in dish_scores:
-            if str(ds.get('menuItemId')) == str(dish_id):
-                total += ds.get('rating', 0)
-                count += 1
-                found_granular = True
-                break
-        
-        # Fallback to general order rating if granular is missing
-        if not found_granular:
-            items = r.get('items', [])
-            for item in items:
-                if str(item.get('menuItemId')) == str(dish_id):
-                    total += r.get('rating', 0)
-                    count += 1
-                    break
-                    
-    return round(total / count, 1) if count > 0 else 0
+# Load environment variables
+load_dotenv()
+
+# MongoDB Configuration
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/Killa_db")
+DB_NAME = os.getenv("DATABASE_NAME", "Killa_db")
+
+def get_db():
+    """Connects to the MongoDB instance."""
+    client = MongoClient(MONGO_URI)
+    return client[DB_NAME]
 
 def get_sentiment(text):
-    """NLP Logic: Analyzes polarity from -1.0 (bad) to 1.0 (good)."""
+    """
+    NLP Logic: Analyzes polarity from -1.0 (bad) to 1.0 (good).
+    Used for offline data cleaning and batch processing.
+    """
     if not text or len(text.strip()) < 3:
         return 0
-    analysis = TextBlob(text)
-    return analysis.sentiment.polarity
+    try:
+        analysis = TextBlob(text)
+        return analysis.sentiment.polarity
+    except:
+        return 0
 
-def calculate_recommendations(db):
+def run_batch_sentiment_update():
     """
-    Advanced Discovery Engine with NLP Sentiment weighting.
-    Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment * 0.2)
+    Utility Function:
+    Iterates through all submitted ratings and updates their sentimentScore in the DB.
+    Useful for data maintenance.
     """
-    print("\n--- AI DISCOVERY ENGINE (NLP ENABLED) START ---")
+    db = get_db()
+    ratings = list(db.ratings.find({"isSubmitted": True}))
+    print(f"--- Starting Batch Sentiment Update for {len(ratings)} reviews ---")
+    
+    updated_count = 0
+    for r in ratings:
+        comment = r.get('comment', '')
+        score = get_sentiment(comment)
+        db.ratings.update_one(
+            {"_id": r["_id"]},
+            {"$set": {"sentimentScore": score}}
+        )
+        updated_count += 1
+    
+    print(f"--- Successfully updated {updated_count} records ---")
+
+def calculate_recommendations_offline():
+    """
+    Standalone version of the recommendation engine.
+    This can be used for generating reports or debugging the scoring logic
+    without needing the Flask server to be active.
+    """
+    db = get_db()
+    print("\n--- OFFLINE DISCOVERY ENGINE (NLP ENABLED) START ---")
 
     all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
     completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
@@ -63,9 +81,6 @@ def calculate_recommendations(db):
         comment = r.get('comment', '')
         score = get_sentiment(comment)
         
-        # Log sentiment for the admin record in Mongo via a side-effect/update
-        # (Usually done in a background job, here we just use it for ranking)
-        
         granular = r.get('dishRatings', [])
         for ds in granular:
             m_id = str(ds.get('menuItemId'))
@@ -73,20 +88,18 @@ def calculate_recommendations(db):
             if score != 0:
                 dish_sentiment[m_id].append(score)
 
-    # 3. Hybrid Scoring Logic
+    # 3. Hybrid Scoring Logic (50% Volume, 30% Stars, 20% Sentiment)
     scored_dishes = []
     for item in all_food_items:
-        m_id = str(item["_id"])
+        m_id = str(item.get("_id") or item.get("id"))
         volume = sales_volume.get(m_id, 0)
         
-        # Granular Stars
         avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores else 0
-        
-        # NLP Sentiment weighting
         avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment else 0
-        sentiment_bonus = avg_s * 5 # Scale sentiment (-1 to 1) to match 0-5 stars
         
-        # Formula: 50% Volume, 30% Granular Stars, 20% NLP Sentiment
+        # Scale sentiment (-1 to 1) to match 0-5 stars
+        sentiment_bonus = avg_s * 5
+        
         final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus)
 
         scored_dishes.append({
@@ -96,15 +109,26 @@ def calculate_recommendations(db):
             "sales": volume
         })
 
-    # 4. Final Mix Construction
+    # 4. Sort and Build Discovery Mix
     scored_dishes.sort(key=lambda x: x["score"], reverse=True)
     
-    final_ids = [d["id"] for d in scored_dishes[:3]] # Top 3
-    discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
+    # Top 3
+    final_ids = [d["id"] for d in scored_dishes[:3]]
     
+    # Discovery items (New or Low Sales)
+    discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
     if discovery_pool:
         random.shuffle(discovery_pool)
-        final_ids.extend(discovery_pool[:2]) # Add 2 randoms
+        final_ids.extend(discovery_pool[:2])
 
-    print(f"RANKING LOG: {scored_dishes[:5]}")
+    print("RANKING LOG (Top 5):")
+    for d in scored_dishes[:5]:
+        print(f"- {d['name']}: {d['score']}")
+        
     return final_ids
+
+if __name__ == "__main__":
+    # If run directly, perform a test recommendation and batch update
+    run_batch_sentiment_update()
+    recommendations = calculate_recommendations_offline()
+    print(f"\nRecommended IDs: {recommendations}")

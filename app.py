@@ -1,39 +1,30 @@
 import random
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from collections import defaultdict
-from datetime import datetime
-from textblob import TextBlob  # Required: pip install textblob
+from textblob import TextBlob
+from pymongo import MongoClient
+import os
+from dotenv import load_dotenv
 
-def calculate_average_rating(ratings, dish_id):
-    """Calculates the average rating for a specific dish using granular data."""
-    total = 0
-    count = 0
-    for r in ratings:
-        # 1. Prioritize granular dish ratings
-        dish_scores = r.get('dishRatings', [])
-        found_granular = False
-        
-        for ds in dish_scores:
-            if str(ds.get('menuItemId')) == str(dish_id):
-                total += ds.get('rating', 0)
-                count += 1
-                found_granular = True
-                break
-        
-        # 2. Fallback to general order rating if granular is missing (backward compatibility)
-        if not found_granular:
-            items = r.get('items', [])
-            for item in items:
-                if str(item.get('menuItemId')) == str(dish_id):
-                    total += r.get('rating', 0)
-                    count += 1
-                    break
-                    
-    return round(total / count, 1) if count > 0 else 0
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for communication with the Node.js backend
+
+# MongoDB Configuration
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/Killa_db")
+DB_NAME = os.getenv("DATABASE_NAME", "Killa_db")
+
+def get_db():
+    client = MongoClient(MONGO_URI)
+    return client[DB_NAME]
 
 def get_sentiment(text):
     """
     NLP Logic: Analyzes polarity from -1.0 (very negative) to 1.0 (very positive).
-    We use this to adjust dish ranking scores beyond just simple star ratings.
+    Includes manual keyword boost logic for restaurant-specific context.
     """
     if not text or len(text.strip()) < 3:
         return 0
@@ -41,91 +32,123 @@ def get_sentiment(text):
     try:
         analysis = TextBlob(text)
         score = analysis.sentiment.polarity
-        
+
         # Keyword Boost Logic: Manual correction for common restaurant terms
         text_lower = text.lower()
-        if "best" in text_lower or "amazing" in text_lower or "legendary" in text_lower:
+        
+        # Positive Boosts
+        if any(word in text_lower for word in ["best", "amazing", "legendary", "delicious", "excellent"]):
             score += 0.2
-        if "cold" in text_lower or "late" in text_lower or "salty" in text_lower:
+            
+        # Negative Penalties
+        if any(word in text_lower for word in ["cold", "late", "salty", "bad", "terrible", "worst"]):
             score -= 0.3
             
-        return max(-1.0, min(1.0, score)) # Clamp between -1 and 1
+        return max(-1.0, min(1.0, score))  # Clamp between -1 and 1
     except:
         return 0
 
-def calculate_recommendations(db):
+@app.route('/aiml/recommend', methods=['POST'])
+def recommend():
     """
     AI Discovery Engine v2 (Sentiment Aware).
-    New Scoring Formula: (Sales * 0.4) + (Granular Avg * 0.4) + (Sentiment Score * 0.2)
+    Logic flow:
+    1. Aggregate Sales Performance (50% weight)
+    2. Process Granular Dish Ratings (30% weight)
+    3. Process Review Tone via NLP Sentiment (20% weight)
+    4. Mix in Discovery Items (New/Low sales)
     """
-    print("\n--- AI SENTIMENT ENGINE START ---")
+    try:
+        db = get_db()
+        data = request.get_json()
+        user_id = data.get('userId')
 
-    all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
-    completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
-    ratings = list(db.ratings.find({"isSubmitted": True}))
+        print("\n--- AI SENTIMENT ENGINE START ---")
 
-    sales_volume = defaultdict(int)
-    rating_scores = defaultdict(list)
-    dish_sentiment = defaultdict(list)
+        # Fetch Data from MongoDB
+        all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
+        completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
+        ratings = list(db.ratings.find({"isSubmitted": True}))
 
-    # 1. Aggregate Sales Performance
-    for order in completed_orders:
-        for item in order.get("items", []):
-            m_id = str(item.get("menuItemId"))
-            sales_volume[m_id] += item.get("quantity", 1)
+        sales_volume = defaultdict(int)
+        rating_scores = defaultdict(list)
+        dish_sentiment = defaultdict(list)
 
-    # 2. Process Granular Dish Ratings & Comment Sentiment
-    for r in ratings:
-        comment = r.get('comment', '')
-        # Calculate sentiment for the overall review
-        s_score = get_sentiment(comment)
+        # 1. Aggregate Sales Performance
+        for order in completed_orders:
+            for item in order.get("items", []):
+                m_id = str(item.get("menuItemId"))
+                sales_volume[m_id] += item.get("quantity", 1)
+
+        # 2. Process Granular Dish Ratings & Comment Sentiment
+        for r in ratings:
+            comment = r.get('comment', '')
+            s_score = get_sentiment(comment)
+
+            # Update sentiment score in DB as a side effect (for Admin visibility)
+            db.ratings.update_one({"_id": r["_id"]}, {"$set": {"sentimentScore": s_score}})
+
+            granular = r.get('dishRatings', [])
+            for ds in granular:
+                m_id = str(ds.get('menuItemId'))
+                rating_scores[m_id].append(ds.get('rating', 0))
+                if s_score != 0:
+                    dish_sentiment[m_id].append(s_score)
+
+        # 3. Hybrid Scoring Logic (Weighting Volume + Satisfaction + Tone)
+        scored_dishes = []
+        for item in all_food_items:
+            # Handle different ID formats (Node.js _id vs simple id string)
+            m_id = str(item.get("_id") or item.get("id"))
+            
+            # Metric A: Popularity (Sales) - 50%
+            volume = sales_volume.get(m_id, 0)
+
+            # Metric B: Satisfaction (Stars) - 30%
+            avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores else 0
+
+            # Metric C: Tone (Sentiment) - 20%
+            avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment else 0
+            
+            # Scale sentiment (-1 to 1) to match 0-5 stars range for fair weighting
+            sentiment_bonus = avg_s * 5 
+
+            # Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment Bonus * 0.2)
+            final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus)
+
+            scored_dishes.append({
+                "id": m_id,
+                "name": item["name"],
+                "score": round(final_score, 2),
+                "sales": volume
+            })
+
+        # 4. Sort and Build Discovery Mix
+        scored_dishes.sort(key=lambda x: x["score"], reverse=True)
+
+        # Get Top 3 based on Score
+        final_ids = [d["id"] for d in scored_dishes[:3]]
+
+        # Select 2 Discovery items (New or Low Sales < 15) that aren't in the Top 3
+        discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
         
-        # Save sentiment back to DB for Admin viewing (side-effect)
-        db.ratings.update_one({"_id": r["_id"]}, {"$set": {"sentimentScore": s_score}})
-        
-        granular = r.get('dishRatings', [])
-        for ds in granular:
-            m_id = str(ds.get('menuItemId'))
-            rating_scores[m_id].append(ds.get('rating', 0))
-            if s_score != 0:
-                dish_sentiment[m_id].append(s_score)
+        if discovery_pool:
+            random.shuffle(discovery_pool)
+            final_ids.extend(discovery_pool[:2])
 
-    # 3. Apply Hybrid Scoring (Weighting Volume + Satisfaction + Tone)
-    scored_dishes = []
-    for item in all_food_items:
-        m_id = str(item["_id"])
-        
-        # Metric A: Popularity (Sales)
-        volume = sales_volume.get(m_id, 0)
-        
-        # Metric B: Satisfaction (Stars)
-        avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores else 0
-        
-        # Metric C: Tone (Sentiment)
-        avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment else 0
-        sentiment_bonus = avg_s * 5 # Scale -1 to 1 into a star-comparable weight
-        
-        # Formula: 40% Sales, 40% Stars, 20% AI Tone
-        final_score = (0.4 * volume) + (0.4 * avg_r) + (0.2 * sentiment_bonus)
+        top_pick = scored_dishes[0]['name'] if scored_dishes else 'N/A'
+        print(f"TOP AI PICK: {top_pick} (Score: {scored_dishes[0]['score'] if scored_dishes else 0})")
 
-        scored_dishes.append({
-            "id": m_id,
-            "name": item["name"],
-            "score": round(final_score, 2),
-            "sales": volume
-        })
+        return jsonify({"recommendations": final_ids})
 
-    # 4. Sort and Build Discovery Mix
-    scored_dishes.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Top 3 based on Score
-    final_ids = [d["id"] for d in scored_dishes[:3]]
-    
-    # Select 2 Discovery items (New or Low Sales)
-    discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
-    if discovery_pool:
-        random.shuffle(discovery_pool)
-        final_ids.extend(discovery_pool[:2])
+    except Exception as e:
+        print(f"Error in Recommendation Engine: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-    print(f"TOP AI PICK: {scored_dishes[0]['name'] if scored_dishes else 'N/A'} (Score: {scored_dishes[0]['score'] if scored_dishes else 0})")
-    return final_ids
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "AI Service Online", "port": 8000})
+
+if __name__ == '__main__':
+    # Running on localhost:8000 as per user requirements
+    app.run(host='0.0.0.0', port=8000, debug=True)
