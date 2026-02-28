@@ -1,111 +1,110 @@
 import random
 from collections import defaultdict
 from datetime import datetime
+from textblob import TextBlob  # NEW: NLP library for Sentiment Analysis
 
 def calculate_average_rating(ratings, dish_id):
-    """Calculates the average rating for a specific dish."""
+    """Calculates the average rating for a specific dish using granular data."""
     total = 0
     count = 0
     for r in ratings:
-        if str(r.get('menuItemId')) == str(dish_id):
-            total += r.get('rating', 0)
-            count += 1
+        # Check granular dish ratings if they exist
+        dish_scores = r.get('dishRatings', [])
+        found_granular = False
+        
+        for ds in dish_scores:
+            if str(ds.get('menuItemId')) == str(dish_id):
+                total += ds.get('rating', 0)
+                count += 1
+                found_granular = True
+                break
+        
+        # Fallback to general order rating if granular is missing
+        if not found_granular:
+            items = r.get('items', [])
+            for item in items:
+                if str(item.get('menuItemId')) == str(dish_id):
+                    total += r.get('rating', 0)
+                    count += 1
+                    break
+                    
     return round(total / count, 1) if count > 0 else 0
 
+def get_sentiment(text):
+    """NLP Logic: Analyzes polarity from -1.0 (bad) to 1.0 (good)."""
+    if not text or len(text.strip()) < 3:
+        return 0
+    analysis = TextBlob(text)
+    return analysis.sentiment.polarity
 
 def calculate_recommendations(db):
     """
-    Advanced Recommendation Engine (Food Only):
-    Filters out 'drinks' and focuses on Veg/Non-Veg.
-    Mixes Top-Sellers (3 items) with Random New Arrivals (2 items) for discovery.
+    Advanced Discovery Engine with NLP Sentiment weighting.
+    Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment * 0.2)
     """
-    print("\n--- AI DISCOVERY ENGINE (FOOD ONLY) START ---")
-    
-    # 1. Fetch data from MongoDB
-    # Exclude 'drinks' category from recommendations
-    all_food_items = list(db.menuitems.find({
-        "isAvailable": True,
-        "category": {"$ne": "drinks"}
-    }))
-    
-    completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
-    ratings = list(db.ratings.find())
+    print("\n--- AI DISCOVERY ENGINE (NLP ENABLED) START ---")
 
-    # Data structures for scoring
+    all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
+    completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
+    ratings = list(db.ratings.find({"isSubmitted": True}))
+
     sales_volume = defaultdict(int)
     rating_scores = defaultdict(list)
-    
-    # 2. Process Sales Volume
+    dish_sentiment = defaultdict(list)
+
+    # 1. Process Sales
     for order in completed_orders:
         for item in order.get("items", []):
-            m_id = str(item["menuItemId"])
+            m_id = str(item.get("menuItemId"))
             sales_volume[m_id] += item.get("quantity", 1)
 
-    # 3. Process Ratings
+    # 2. Process Granular Ratings & NLP Sentiment
     for r in ratings:
-        m_id = str(r.get("menuItemId"))
-        rating_scores[m_id].append(r.get("rating", 0))
+        comment = r.get('comment', '')
+        score = get_sentiment(comment)
+        
+        # Log sentiment for the admin record in Mongo via a side-effect/update
+        # (Usually done in a background job, here we just use it for ranking)
+        
+        granular = r.get('dishRatings', [])
+        for ds in granular:
+            m_id = str(ds.get('menuItemId'))
+            rating_scores[m_id].append(ds.get('rating', 0))
+            if score != 0:
+                dish_sentiment[m_id].append(score)
 
-    # 4. Score Food Items
+    # 3. Hybrid Scoring Logic
     scored_dishes = []
     for item in all_food_items:
         m_id = str(item["_id"])
-        
-        # Calculate Base Stats
         volume = sales_volume.get(m_id, 0)
+        
+        # Granular Stars
         avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores else 0
         
-        # Scoring Formula: 60% Volume, 40% Rating
-        score = (0.6 * volume) + (0.4 * avg_r)
+        # NLP Sentiment weighting
+        avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment else 0
+        sentiment_bonus = avg_s * 5 # Scale sentiment (-1 to 1) to match 0-5 stars
         
+        # Formula: 50% Volume, 30% Granular Stars, 20% NLP Sentiment
+        final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus)
+
         scored_dishes.append({
             "id": m_id,
             "name": item["name"],
-            "score": round(score, 1),
-            "sales": volume,
-            "createdAt": item.get("createdAt", datetime.min)
+            "score": round(final_score, 2),
+            "sales": volume
         })
 
-    # Sort by performance (Top Sellers)
+    # 4. Final Mix Construction
     scored_dishes.sort(key=lambda x: x["score"], reverse=True)
-
-    # 5. Identify "Discovery Candidates" (Randomized Selection)
-    # Get all food items with low sales count (< 15)
-    discovery_pool = [d for d in scored_dishes if d["sales"] < 15]
     
-    # 6. Construct Final Hybrid List (Mix: 3 Top Sellers + 2 Random Discovery)
-    final_recommendation_ids = []
+    final_ids = [d["id"] for d in scored_dishes[:3]] # Top 3
+    discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
     
-    # Take top 3 established performers
-    for d in scored_dishes[:3]:
-        final_recommendation_ids.append(d["id"])
-        print(f" [ESTABLISHED FOOD] {d['name']} - Score: {d['score']}")
+    if discovery_pool:
+        random.shuffle(discovery_pool)
+        final_ids.extend(discovery_pool[:2]) # Add 2 randoms
 
-    # Randomized Discovery: Pick 2 random items from the discovery pool
-    # Excluding those already in the top 3
-    remaining_discovery_pool = [d for d in discovery_pool if d["id"] not in final_recommendation_ids]
-    
-    if remaining_discovery_pool:
-        # Shuffle the pool for randomness
-        random.shuffle(remaining_discovery_pool)
-        
-        added_discovery = 0
-        for n in remaining_discovery_pool:
-            final_recommendation_ids.append(n["id"])
-            print(f" [RANDOM DISCOVERY] {n['name']} - Promoted")
-            added_discovery += 1
-            if added_discovery >= 2:
-                break
-
-    # Final Guard: Fill up to 5 if the list is still short
-    if len(final_recommendation_ids) < 5:
-        for d in scored_dishes:
-            if d["id"] not in final_recommendation_ids:
-                final_recommendation_ids.append(d["id"])
-            if len(final_recommendation_ids) >= 5:
-                break
-
-    print(f"FINAL FOOD-ONLY OUTPUT: {final_recommendation_ids}")
-    print("--- AI DISCOVERY ENGINE END ---\n")
-
-    return final_recommendation_ids
+    print(f"RANKING LOG: {scored_dishes[:5]}")
+    return final_ids
