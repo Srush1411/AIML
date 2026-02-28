@@ -2,6 +2,8 @@ import random
 from collections import defaultdict
 from textblob import TextBlob
 from bson.objectid import ObjectId
+import math
+from bson.objectid import ObjectId
 
 def calculate_average_rating(ratings, dish_id):
     """
@@ -154,3 +156,49 @@ def calculate_recommendations(db, user_id=None):
         final_ids.extend(discovery_pool[:2])
 
     return final_ids
+
+
+def sync_dish_rating(db, dish_id):
+    """
+    NEW: Calculates average from 'ratings' and updates 'menuitems'
+    Added at the bottom of the file as requested.
+    """
+    try:
+        # Ensure dish_id is an ObjectId
+        d_id = ObjectId(dish_id) if isinstance(dish_id, str) else dish_id
+
+        # 1. Fetch all submitted ratings containing this dish
+        ratings_cursor = db.ratings.find({
+            "dishRatings.menuItemId": d_id,
+            "isSubmitted": True
+        })
+        
+        all_ratings = list(ratings_cursor)
+        if not all_ratings:
+            return 0
+
+        # 2. Extract specific scores for this dish
+        scores = []
+        for r in all_ratings:
+            for dr in r.get('dishRatings', []):
+                if str(dr.get('menuItemId')) == str(d_id):
+                    scores.append(dr.get('rating', 0))
+
+        if not scores:
+            return 0
+
+        # 3. Calculate Ceiling Average (e.g., 4.1 becomes 5)
+        avg = sum(scores) / len(scores)
+        ceiling_avg = math.ceil(avg)
+
+        # 4. Update the MenuItems collection so User 2 can see it
+        db.menuitems.update_one(
+            {"_id": d_id},
+            {"$set": { "averageRating": ceiling_avg }}
+        )
+        
+        print(f"Updated Dish {dish_id} to Average Rating: {ceiling_avg}")
+        return ceiling_avg
+    except Exception as e:
+        print(f"Error in sync_dish_rating: {e}")
+        return None

@@ -5,6 +5,9 @@ from pymongo import MongoClient
 # IMPORT THE EXTERNAL LOGIC FROM ratings_analysis.py
 from ratings_analysis import calculate_recommendations
 
+# Add 'sync_dish_rating' 
+from ratings_analysis import calculate_recommendations, sync_dish_rating
+
 # Initialize Flask App (Main Server)
 app = Flask(__name__)
 
@@ -49,6 +52,17 @@ def health_check():
         "status": "Killa AIML Engine is active on port 8000",
         "engine": "Communicating with ratings_analysis module successfully"
     }), 200
+
+@app.route('/aiml/update-rating', methods=['POST'])
+def update_rating():
+    data = request.get_json()
+    dish_id = data.get('dishId')
+    
+    if not dish_id:
+        return jsonify({"success": False, "error": "No dishId provided"}), 400
+        
+    new_avg = sync_dish_rating(db, dish_id)
+    return jsonify({"success": True, "newAverage": new_avg})
 
 if __name__ == '__main__':
     # Running on 0.0.0.0 allows connections from other services/containers 
