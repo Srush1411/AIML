@@ -22,10 +22,11 @@ def recommend():
     """
     try:
         data = request.get_json() or {}
+        # Extract the userId sent from the Node.js server (will be None if user is a guest)
         user_id = data.get('userId')
         
-        # Calculate recommendations using the imported ratings_analysis logic
-        recommended_ids = calculate_recommendations(db)
+        # Pass the user_id into the calculation engine for personalization
+        recommended_ids = calculate_recommendations(db, user_id)
         
         return jsonify({
             "success": True,

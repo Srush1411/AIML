@@ -1,6 +1,7 @@
 import random
 from collections import defaultdict
 from textblob import TextBlob
+from bson.objectid import ObjectId
 
 def calculate_average_rating(ratings, dish_id):
     """
@@ -9,7 +10,6 @@ def calculate_average_rating(ratings, dish_id):
     total = 0
     count = 0
     for r in ratings:
-        # 1. Prioritize granular dish ratings
         dish_scores = r.get('dishRatings', [])
         found_granular = False
         for ds in dish_scores:
@@ -19,7 +19,6 @@ def calculate_average_rating(ratings, dish_id):
                 found_granular = True
                 break
         
-        # 2. Fallback to general order rating if granular is missing
         if not found_granular:
             items = r.get('items', [])
             for item in items:
@@ -42,24 +41,23 @@ def get_sentiment(text):
         score = analysis.sentiment.polarity
         text_lower = text.lower()
 
-        # Keyword Boost Logic
         if "best" in text_lower or "amazing" in text_lower or "legendary" in text_lower:
             score += 0.2
             
         if "cold" in text_lower or "late" in text_lower or "salty" in text_lower:
             score -= 0.3
             
-        return max(-1.0, min(1.0, score)) # Clamp between -1 and 1
+        return max(-1.0, min(1.0, score)) 
     except Exception as e:
         print(f"Sentiment Analysis Error: {e}")
         return 0
 
-def calculate_recommendations(db):
+def calculate_recommendations(db, user_id=None):
     """
-    Advanced Discovery Engine with NLP Sentiment weighting.
-    Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment * 0.2)
+    Advanced Discovery Engine with Personalization & NLP Sentiment weighting.
+    Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment * 0.2) + Personal Bonus
     """
-    print("\n--- AI DISCOVERY ENGINE (NLP ENABLED) START ---")
+    print(f"\n--- AI DISCOVERY ENGINE START (User: {user_id if user_id else 'GUEST'}) ---")
 
     all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
     completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
@@ -69,7 +67,31 @@ def calculate_recommendations(db):
     rating_scores = defaultdict(list)
     dish_sentiment = defaultdict(list)
 
-    # 1. Process Sales Volume
+    # --- NEW: PERSONALIZATION DATA GATHERING ---
+    user_ordered_items = set()
+    user_favorite_categories = set()
+
+    if user_id:
+        try:
+            # Find all past orders for this specific user
+            user_orders = list(db.orders.find({"userId": ObjectId(user_id), "orderStatus": "COMPLETED"}))
+            # Fallback if Node saves userId as string instead of ObjectId
+            if not user_orders:
+                user_orders = list(db.orders.find({"userId": str(user_id), "orderStatus": "COMPLETED"}))
+                
+            for order in user_orders:
+                for item in order.get("items", []):
+                    m_id = str(item.get("menuItemId"))
+                    user_ordered_items.add(m_id)
+            
+            # Find categories of items the user has ordered
+            for item in all_food_items:
+                if str(item["_id"]) in user_ordered_items:
+                    user_favorite_categories.add(item.get("category"))
+        except Exception as e:
+            print(f"Personalization Error (safe to ignore): {e}")
+
+    # 1. Process Global Sales Volume
     for order in completed_orders:
         for item in order.get("items", []):
             m_id = str(item.get("menuItemId"))
@@ -80,7 +102,6 @@ def calculate_recommendations(db):
         comment = r.get('comment', '')
         score = get_sentiment(comment)
 
-        # Log sentiment for the admin record in Mongo via a side-effect/update
         if "_id" in r:
             db.ratings.update_one({"_id": r["_id"]}, {"$set": {"sentimentScore": score}})
 
@@ -91,24 +112,28 @@ def calculate_recommendations(db):
             if score != 0:
                 dish_sentiment[m_id].append(score)
 
-    # 3. Hybrid Scoring Logic
+    # 3. Hybrid Scoring Logic with Personalization
     scored_dishes = []
     for item in all_food_items:
         m_id = str(item["_id"])
         
         volume = sales_volume.get(m_id, 0)
-
-        # Granular Stars
         avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores and len(rating_scores[m_id]) > 0 else 0
-
-        # NLP Sentiment weighting
         avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment and len(dish_sentiment[m_id]) > 0 else 0
-        
-        # Scale sentiment (-1 to 1) to match 0-5 stars
         sentiment_bonus = avg_s * 5 
         
-        # Formula: 50% Volume, 30% Granular Stars, 20% NLP Sentiment
-        final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus)
+        # --- NEW: APPLY PERSONALIZATION BONUS ---
+        personal_bonus = 0
+        if user_id:
+            if m_id in user_ordered_items:
+                # Big boost: They have ordered this specific dish before
+                personal_bonus += 5.0 
+            elif item.get("category") in user_favorite_categories:
+                # Small boost: They like this category (e.g., they buy a lot of "Desserts")
+                personal_bonus += 2.0 
+
+        # Formula: 50% Volume, 30% Stars, 20% NLP + User Bias
+        final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus) + personal_bonus
 
         scored_dishes.append({
             "id": m_id,
@@ -120,18 +145,12 @@ def calculate_recommendations(db):
     # 4. Final Mix Construction
     scored_dishes.sort(key=lambda x: x["score"], reverse=True)
 
-    # Top 3 Picks
     final_ids = [d["id"] for d in scored_dishes[:3]]
 
-    # 2 Random Discovery items (underperforming but good)
     discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
     
     if discovery_pool:
         random.shuffle(discovery_pool)
         final_ids.extend(discovery_pool[:2])
 
-    top_pick_name = scored_dishes[0]['name'] if scored_dishes else 'N/A'
-    top_pick_score = scored_dishes[0]['score'] if scored_dishes else 0
-    print(f"TOP AI PICK: {top_pick_name} (Score: {top_pick_score})")
-    
     return final_ids
