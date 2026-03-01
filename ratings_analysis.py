@@ -1,204 +1,286 @@
-import random
-from collections import defaultdict
-from textblob import TextBlob
-from bson.objectid import ObjectId
 import math
-from bson.objectid import ObjectId
+import random
+from bson import ObjectId
+from textblob import TextBlob
+from pymongo import UpdateOne
 
-def calculate_average_rating(ratings, dish_id):
+def custom_rating_round(avg):
     """
-    Calculates the average rating for a specific dish using granular data.
+    Custom rounding logic requested:
+    - If decimal is <= 0.5 (e.g., 4.2, 4.4, 4.5), floor it down
+    - If decimal is >= 0.6 (e.g., 4.6, 4.8), ceil it up
     """
-    total = 0
-    count = 0
-    for r in ratings:
-        dish_scores = r.get('dishRatings', [])
-        found_granular = False
-        for ds in dish_scores:
-            if str(ds.get('menuItemId')) == str(dish_id):
-                total += ds.get('rating', 0)
-                count += 1
-                found_granular = True
-                break
-        
-        if not found_granular:
-            items = r.get('items', [])
-            for item in items:
-                if str(item.get('menuItemId')) == str(dish_id):
-                    total += r.get('rating', 0)
-                    count += 1
-                    break
-                    
-    return round(total / count, 1) if count > 0 else 0
-
-def get_sentiment(text):
-    """
-    NLP Logic: Analyzes polarity from -1.0 (very negative) to 1.0 (very positive).
-    """
-    if not text or len(text.strip()) < 3:
-        return 0
-
-    try:
-        analysis = TextBlob(text)
-        score = analysis.sentiment.polarity
-        text_lower = text.lower()
-
-        if "best" in text_lower or "amazing" in text_lower or "legendary" in text_lower:
-            score += 0.2
-            
-        if "cold" in text_lower or "late" in text_lower or "salty" in text_lower:
-            score -= 0.3
-            
-        return max(-1.0, min(1.0, score)) 
-    except Exception as e:
-        print(f"Sentiment Analysis Error: {e}")
-        return 0
+    decimal_part = avg - math.floor(avg)
+    if decimal_part <= 0.5:
+        return float(math.floor(avg))
+    else:
+        return float(math.ceil(avg))
 
 def calculate_recommendations(db, user_id=None):
     """
-    Advanced Discovery Engine with Personalization & NLP Sentiment weighting.
-    Formula: (Sales * 0.5) + (Avg Rating * 0.3) + (Sentiment * 0.2) + Personal Bonus
+    Hybrid Recommendation Engine with Order Volume Tracking and Guest Support.
     """
-    print(f"\n--- AI DISCOVERY ENGINE START (User: {user_id if user_id else 'GUEST'}) ---")
+    is_guest = not user_id or str(user_id).lower() in ['null', 'undefined', 'none', '']
+    print(f"\n--- AI DISCOVERY ENGINE START (User: {'GUEST' if is_guest else user_id}) ---")
+    
+    menu_col = db['menuitems']
+    order_col = db['orders']
+    
+    # 1. Fetch available items
+    query = {
+        "$and": [
+            {
+                "$or": [
+                    {"isAvailable": True},
+                    {"isAvailable": "true"}
+                ]
+            },
+            {"category": {"$ne": "drinks"}}
+        ]
+    }
+    
+    all_items = list(menu_col.find(query))
+    
+    if not all_items:
+        print(f"!!! No available menu items found in 'menuitems' collection !!!")
+        return []
 
-    all_food_items = list(db.menuitems.find({"isAvailable": True, "category": {"$ne": "drinks"}}))
-    completed_orders = list(db.orders.find({"orderStatus": "COMPLETED"}))
-    ratings = list(db.ratings.find({"isSubmitted": True}))
+    # 2. GLOBAL ORDER VOLUME TRACKING
+    # We find out exactly how many times every dish has been ordered across the restaurant
+    global_order_counts = {}
+    try:
+        all_completed_orders = list(order_col.find({"orderStatus": "COMPLETED"}))
+        for order in all_completed_orders:
+            for item in order.get('items', []):
+                m_id = str(item.get('menuItemId') or item.get('_id'))
+                global_order_counts[m_id] = global_order_counts.get(m_id, 0) + 1
+    except Exception as e:
+        print(f"-> Global Order Tracking Error: {e}")
 
-    sales_volume = defaultdict(int)
-    rating_scores = defaultdict(list)
-    dish_sentiment = defaultdict(list)
-
-    # --- NEW: PERSONALIZATION DATA GATHERING ---
-    user_ordered_items = set()
-    user_favorite_categories = set()
-
-    if user_id:
+    # 3. PERSONALIZATION LOGIC (Logged-in users only)
+    user_history = []
+    if not is_guest:
         try:
-            # Find all past orders for this specific user
-            user_orders = list(db.orders.find({"userId": ObjectId(user_id), "orderStatus": "COMPLETED"}))
-            # Fallback if Node saves userId as string instead of ObjectId
-            if not user_orders:
-                user_orders = list(db.orders.find({"userId": str(user_id), "orderStatus": "COMPLETED"}))
-                
-            for order in user_orders:
-                for item in order.get("items", []):
-                    m_id = str(item.get("menuItemId"))
-                    user_ordered_items.add(m_id)
+            user_orders = list(order_col.find({
+                "userId": ObjectId(user_id), 
+                "orderStatus": "COMPLETED" 
+            }))
             
-            # Find categories of items the user has ordered
-            for item in all_food_items:
-                if str(item["_id"]) in user_ordered_items:
-                    user_favorite_categories.add(item.get("category"))
+            for order in user_orders:
+                for item in order.get('items', []):
+                    m_id = str(item.get('menuItemId') or item.get('_id'))
+                    if m_id:
+                        user_history.append(m_id)
+            print(f"-> Found {len(user_history)} past items in user history.")
         except Exception as e:
-            print(f"Personalization Error (safe to ignore): {e}")
+            print(f"-> User History Error: {e}")
+    else:
+        print("-> Guest User Detected. Relying on global order volume and ratings.")
 
-    # 1. Process Global Sales Volume
-    for order in completed_orders:
-        for item in order.get("items", []):
-            m_id = str(item.get("menuItemId"))
-            sales_volume[m_id] += item.get("quantity", 1)
-
-    # 2. Process Granular Dish Ratings & Comment Sentiment
-    for r in ratings:
-        comment = r.get('comment', '')
-        score = get_sentiment(comment)
-
-        if "_id" in r:
-            db.ratings.update_one({"_id": r["_id"]}, {"$set": {"sentimentScore": score}})
-
-        granular = r.get('dishRatings', [])
-        for ds in granular:
-            m_id = str(ds.get('menuItemId'))
-            rating_scores[m_id].append(ds.get('rating', 0))
-            if score != 0:
-                dish_sentiment[m_id].append(score)
-
-    # 3. Hybrid Scoring Logic with Personalization
     scored_dishes = []
-    for item in all_food_items:
-        m_id = str(item["_id"])
-        
-        volume = sales_volume.get(m_id, 0)
-        avg_r = sum(rating_scores[m_id]) / len(rating_scores[m_id]) if m_id in rating_scores and len(rating_scores[m_id]) > 0 else 0
-        avg_s = sum(dish_sentiment[m_id]) / len(dish_sentiment[m_id]) if m_id in dish_sentiment and len(dish_sentiment[m_id]) > 0 else 0
-        sentiment_bonus = avg_s * 5 
-        
-        # --- NEW: APPLY PERSONALIZATION BONUS ---
-        personal_bonus = 0
-        if user_id:
-            if m_id in user_ordered_items:
-                # Big boost: They have ordered this specific dish before
-                personal_bonus += 5.0 
-            elif item.get("category") in user_favorite_categories:
-                # Small boost: They like this category (e.g., they buy a lot of "Desserts")
-                personal_bonus += 2.0 
+    print(f"{'DISH NAME':<24} | {'RATING':<7} | {'REVIEWS':<7} | {'ORDERS':<7} | {'SCORE':<7}")
+    print("-" * 70)
 
-        # Formula: 50% Volume, 30% Stars, 20% NLP + User Bias
-        final_score = (0.5 * volume) + (0.3 * avg_r) + (0.2 * sentiment_bonus) + personal_bonus
-
+    for item in all_items:
+        item_id = str(item['_id'])
+        name = item.get('name', 'Unknown Dish')
+        
+        # Extract metadata
+        avg_rating = item.get('averageRating', 0)
+        review_count = item.get('totalReviews', 0)
+        order_count = global_order_counts.get(item_id, 0)
+        
+        # --- NEW SCORING ALGORITHM ---
+        # 1. Base Quality: Average Rating * 10 (Max 50 points)
+        rating_points = avg_rating * 10
+        
+        # 2. Review Trust: Bonus for having lots of written reviews (Max 10 points)
+        review_points = min(review_count * 2, 10)
+        
+        # 3. Order Popularity: Bonus based on the sheer number of times ordered (Max 25 points)
+        popularity_points = min(order_count * 2, 25)
+        
+        # 4. Personalization: Boost items the logged-in user has ordered before
+        personal_bonus = 15 if item_id in user_history else 0
+        
+        final_score = rating_points + review_points + popularity_points + personal_bonus
+        
+        print(f"{name[:23]:<24} | {avg_rating:<7.1f} | {review_count:<7} | {order_count:<7} | {final_score:<7.1f}")
+        
         scored_dishes.append({
-            "id": m_id,
-            "name": item.get("name", "Unknown"),
-            "score": round(final_score, 2),
-            "sales": volume
+            "id": item_id,
+            "name": name,
+            "score": final_score,
+            "reviews": review_count,
+            "orders": order_count
         })
 
-    # 4. Final Mix Construction
+    # Sort by AI Score descending
     scored_dishes.sort(key=lambda x: x["score"], reverse=True)
-
-    final_ids = [d["id"] for d in scored_dishes[:3]]
-
-    discovery_pool = [d["id"] for d in scored_dishes if d["sales"] < 15 and d["id"] not in final_ids]
     
-    if discovery_pool:
-        random.shuffle(discovery_pool)
-        final_ids.extend(discovery_pool[:2])
+    # --- BALANCING LOGIC: EXPLOITATION VS EXPLORATION ---
+    
+    # Step 1: Exploitation (Get the top 2 absolute best performing dishes)
+    top_performers = scored_dishes[:2]
+    top_ids = [d["id"] for d in top_performers]
 
-    return final_ids
+    # Step 2: Exploration (Create a Discovery Pool)
+    # Target items with low reviews OR low orders to give them exposure
+    discovery_pool = [d for d in scored_dishes if d["id"] not in top_ids and (d["reviews"] < 5 or d["orders"] < 5)]
+    
+    # Fallback: If everything has high orders/reviews, just use any remaining items
+    if not discovery_pool:
+        discovery_pool = [d for d in scored_dishes if d["id"] not in top_ids]
 
+    # Step 3: Randomly pick 2 dishes from the discovery pool
+    random.shuffle(discovery_pool)
+    discovery_picks = discovery_pool[:2]
+
+    # Step 4: Combine them
+    final_picks = top_performers + discovery_picks
+    
+    # Step 5: Shuffle the final list
+    random.shuffle(final_picks)
+
+    print("-" * 70)
+    print(f"TOP PERFORMERS (Math): {[d['name'] for d in top_performers]}")
+    print(f"DISCOVERY PICKS (Random): {[d['name'] for d in discovery_picks]}")
+    print(f"FINAL SHUFFLED DISPLAY: {[d['name'] for d in final_picks]}")
+    print("--- AI DISCOVERY ENGINE END ---\n")
+    
+    return [d["id"] for d in final_picks]
 
 def sync_dish_rating(db, dish_id):
     """
-    NEW: Calculates average from 'ratings' and updates 'menuitems'
-    Added at the bottom of the file as requested.
+    Syncs ratings from 'ratings' collection to 'menuitems' collection for a specific dish.
     """
+    print(f"\n--- SYNCING RATING: {dish_id} ---")
     try:
-        # Ensure dish_id is an ObjectId
         d_id = ObjectId(dish_id) if isinstance(dish_id, str) else dish_id
+        
+        rating_col = db['ratings']
+        menu_col = db['menuitems']
 
-        # 1. Fetch all submitted ratings containing this dish
-        ratings_cursor = db.ratings.find({
+        # 1. Fetch all submitted ratings for this specific dish
+        cursor = rating_col.find({
             "dishRatings.menuItemId": d_id,
             "isSubmitted": True
         })
         
-        all_ratings = list(ratings_cursor)
-        if not all_ratings:
+        feedbacks = list(cursor)
+        
+        if not feedbacks:
+            menu_col.update_one(
+                {"_id": d_id},
+                {"$set": {"averageRating": 0, "totalReviews": 0, "sentimentScore": 0}}
+            )
             return 0
 
-        # 2. Extract specific scores for this dish
         scores = []
-        for r in all_ratings:
-            for dr in r.get('dishRatings', []):
+        sentiments = []
+
+        for f in feedbacks:
+            for dr in f.get('dishRatings', []):
                 if str(dr.get('menuItemId')) == str(d_id):
                     scores.append(dr.get('rating', 0))
+            
+            comment = f.get('comment', '')
+            if comment:
+                blob = TextBlob(comment)
+                sentiments.append(blob.sentiment.polarity)
 
         if not scores:
             return 0
 
-        # 3. Calculate Ceiling Average (e.g., 4.1 becomes 5)
-        avg = sum(scores) / len(scores)
-        ceiling_avg = math.ceil(avg)
+        # 2. Compute Averages with custom Floor/Ceil logic
+        raw_avg_rating = sum(scores) / len(scores)
+        final_rating = custom_rating_round(raw_avg_rating)
+        
+        avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
 
-        # 4. Update the MenuItems collection so User 2 can see it
-        db.menuitems.update_one(
+        # 3. Persist to MenuItem
+        menu_col.update_one(
             {"_id": d_id},
-            {"$set": { "averageRating": ceiling_avg }}
+            {
+                "$set": {
+                    "averageRating": final_rating,
+                    "totalReviews": len(scores),
+                    "sentimentScore": round(avg_sentiment, 2)
+                }
+            }
         )
         
-        print(f"Updated Dish {dish_id} to Average Rating: {ceiling_avg}")
-        return ceiling_avg
+        print(f"-> Success: {final_rating} stars updated based on {len(scores)} reviews (Raw Math: {raw_avg_rating:.2f}).")
+        return final_rating
+
     except Exception as e:
-        print(f"Error in sync_dish_rating: {e}")
-        return None
+        print(f"!!! Sync Failed: {e}")
+        return 0
+
+def bulk_sync_all(db):
+    """
+    Highly Optimized Bulk Sync for MongoDB Free Tier (M0).
+    Reduces hundreds of individual queries to just 1 Read and 2 Writes.
+    """
+    print("\n--- INITIATING OPTIMIZED GLOBAL RATING SYNC ---")
+    try:
+        rating_col = db['ratings']
+        menu_col = db['menuitems']
+
+        # 1. Fetch ALL submitted ratings
+        all_feedbacks = list(rating_col.find({"isSubmitted": True}))
+        print(f"-> Fetched {len(all_feedbacks)} total reviews from database.")
+
+        # 2. Process math and NLP strictly in Python memory
+        dish_stats = {}
+        for f in all_feedbacks:
+            comment = f.get('comment', '')
+            sentiment = 0
+            if comment:
+                blob = TextBlob(comment)
+                sentiment = blob.sentiment.polarity
+            
+            for dr in f.get('dishRatings', []):
+                m_id = str(dr.get('menuItemId'))
+                if m_id not in dish_stats:
+                    dish_stats[m_id] = {'scores': [], 'sentiments': []}
+                
+                dish_stats[m_id]['scores'].append(dr.get('rating', 0))
+                if comment:
+                    dish_stats[m_id]['sentiments'].append(sentiment)
+
+        # 3. Prepare Bulk Write Operations
+        bulk_ops = []
+        for m_id, stats in dish_stats.items():
+            scores = stats['scores']
+            sentiments = stats['sentiments']
+            
+            if not scores: continue
+
+            raw_avg = sum(scores) / len(scores)
+            final_rating = custom_rating_round(raw_avg)
+            avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
+
+            bulk_ops.append(
+                UpdateOne(
+                    {"_id": ObjectId(m_id)},
+                    {"$set": {
+                        "averageRating": final_rating,
+                        "totalReviews": len(scores),
+                        "sentimentScore": round(avg_sentiment, 2)
+                    }}
+                )
+            )
+
+        # 4. Execute DB Updates efficiently
+        menu_col.update_many({}, {"$set": {"averageRating": 0, "totalReviews": 0, "sentimentScore": 0}})
+        
+        if bulk_ops:
+            menu_col.bulk_write(bulk_ops)
+
+        print(f"--- GLOBAL SYNC COMPLETE: {len(bulk_ops)} dishes updated safely --- \n")
+        return len(bulk_ops)
+
+    except Exception as e:
+        print(f"!!! Optimized Bulk Sync Failed: {e}")
+        return 0
